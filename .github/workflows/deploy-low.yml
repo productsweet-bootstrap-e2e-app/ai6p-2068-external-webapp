@@ -1,0 +1,173 @@
+# Low-environment deployment — orchestrates the Amplify RELEASE job for every
+# push to main whose changeset touches deployment-relevant paths. This is the
+# low (auto-deploy) leg of the webapp-owned delivery model (AI6P-826): pushing
+# to main deploys the LOW environment automatically; promotion to any higher
+# environment is gated behind the `promote-<env>.yml` workflows, which have no
+# push trigger and run only when the Product Sweet webapp dispatches them with
+# the reviewed commit pinned as a `sha` input ("the gate is the trigger").
+#
+# AI6P-249 / AI6P-278 / AI6P-017 / AI6P-414 / AI6P-826 lessons:
+#   - `permissions: id-token: write` enables OIDC token minting
+#     (canonical-checklist §B4).
+#   - Amplify auto-build is OFF (canonical-checklist §C4) — this workflow is
+#     the sole low-env release path. We start the job, then poll until terminal.
+#   - Actions are SHA-pinned per AI6P-103/-104 supply-chain hardening.
+#   - The deploy-role ARN reference uses `PRODUCTSWEET_DEPLOY_ROLE_ARN` (the
+#     variable the engine actually provisions in `secrets-placeholders-
+#     provisioned`, AI6P-274). The Amplify appId reference uses
+#     `PRODUCTSWEET_AMPLIFY_APP_ID`, written by `hosting-provisioned` after
+#     CreateApp succeeds. The region is baked in at materialise time
+#     (AWS_REGION placeholder) because it is per-project static and the
+#     engine knows it from the manifest.
+#
+# Templated by the AI6P-249 bootstrap; substituted placeholders:
+#   MAIN_PATH_FILTERS  YAML-list of framework-specific deployment paths
+#   INSTALL_COMMAND    e.g. `npm ci --no-audit --no-fund`
+#   BUILD_COMMAND      e.g. `npm run build`
+#   AWS_REGION         baked-in region, e.g. `ap-southeast-2`
+name: deploy-low
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "public/**"
+      - "index.html"
+      - "vite.config.ts"
+      - "tsconfig.json"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-low
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          # Node 24 — matches the Product Sweet build agent so the
+          # package-lock.json it generates is faithful to what `npm ci`
+          # validates.
+          node-version: 24
+          cache: npm
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+        with:
+          role-to-assume: ${{ vars.PRODUCTSWEET_DEPLOY_ROLE_ARN }}
+          aws-region: ap-southeast-2
+
+      # AI6P-1566: apply the static-frontend health-signal alarms (build-failure
+      # + custom-domain CloudFront 5xx). Best-effort (continue-on-error) — this
+      # is an additive health baseline, never a deploy gate, so a missing IAM
+      # grant or transient CFN error must not block the site deploy. The guard
+      # skips projects (e.g. webapp) whose tree carries no monitoring template.
+      - name: Apply monitoring stack
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ -f monitoring/monitoring.yaml ]; then
+            echo "Applying monitoring stack from monitoring/monitoring.yaml"
+            aws cloudformation deploy \
+              --template-file monitoring/monitoring.yaml \
+              --stack-name productsweet-monitoring \
+              --parameter-overrides \
+                AmplifyAppId="${{ vars.PRODUCTSWEET_AMPLIFY_APP_ID }}" \
+              --no-fail-on-empty-changeset
+          else
+            echo "No monitoring/monitoring.yaml in this repo — skipping monitoring stack."
+          fi
+
+      # AI6P-1720: apply the CloudFront 5xx alarm as a SEPARATE us-east-1 stack.
+      # AWS/CloudFront metrics publish only to us-east-1, so applying it in the
+      # tenant region (as AI6P-1566 did inline) left the alarm region-inert and
+      # green-with-no-data. Only custom-domain tenants emit
+      # monitoring/monitoring-cloudfront.yaml, so the guard skips the
+      # *.amplifyapp.com fallback. Best-effort (continue-on-error), same posture
+      # as the tenant-region monitoring stack above.
+      - name: Apply CloudFront monitoring stack (us-east-1)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ -f monitoring/monitoring-cloudfront.yaml ]; then
+            echo "Applying CloudFront monitoring stack (us-east-1) from monitoring/monitoring-cloudfront.yaml"
+            aws cloudformation deploy \
+              --region us-east-1 \
+              --template-file monitoring/monitoring-cloudfront.yaml \
+              --stack-name productsweet-monitoring-cloudfront \
+              --parameter-overrides \
+                CloudFrontDistributionId="${{ vars.PRODUCTSWEET_CLOUDFRONT_DISTRIBUTION_ID }}" \
+              --no-fail-on-empty-changeset
+          else
+            echo "No monitoring/monitoring-cloudfront.yaml in this repo — skipping CloudFront monitoring stack."
+          fi
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Trigger Amplify RELEASE
+        id: release
+        run: |
+          set -euo pipefail
+          job_id=$(aws amplify start-job \
+            --app-id "${{ vars.PRODUCTSWEET_AMPLIFY_APP_ID }}" \
+            --branch-name main \
+            --job-type RELEASE \
+            --query 'jobSummary.jobId' \
+            --output text)
+          echo "job_id=$job_id" >> "$GITHUB_OUTPUT"
+          echo "Started Amplify job $job_id"
+
+      - name: Poll Amplify job to terminal status
+        run: |
+          set -euo pipefail
+          job_id="${{ steps.release.outputs.job_id }}"
+          for i in $(seq 1 60); do
+            status=$(aws amplify get-job \
+              --app-id "${{ vars.PRODUCTSWEET_AMPLIFY_APP_ID }}" \
+              --branch-name main \
+              --job-id "$job_id" \
+              --query 'job.summary.status' \
+              --output text)
+            echo "Amplify job $job_id status: $status (poll $i/60)"
+            case "$status" in
+              SUCCEED) exit 0 ;;
+              FAILED|CANCELLED) exit 1 ;;
+              PENDING|PROVISIONING|RUNNING) sleep 30 ;;
+              *) echo "Unknown status $status" >&2; exit 1 ;;
+            esac
+          done
+          echo "Timed out after 30 minutes" >&2
+          exit 1
+
+      # AI6P-1566: feed the AmplifyBuildFailureAlarm. When any prior deploy step
+      # failed, record ProductSweet/Deploy BuildFailure=1 so the health-signal
+      # alarm reflects the failed deploy. Best-effort — a missing PutMetricData
+      # grant must not turn a build failure into an additional workflow error.
+      - name: Record Amplify build-failure metric
+        if: failure()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          aws cloudwatch put-metric-data \
+            --namespace ProductSweet/Deploy \
+            --metric-name BuildFailure \
+            --value 1 \
+            --dimensions App="${{ vars.PRODUCTSWEET_AMPLIFY_APP_ID }}"
